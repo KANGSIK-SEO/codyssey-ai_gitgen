@@ -1,23 +1,27 @@
-"""AI 기반 Git 커밋/PR 자동 생성 CLI.
+"""OpenAI GPT 기반 Git 커밋/PR 자동 생성 CLI.
 
 요구:
-- ANTHROPIC_API_KEY 환경변수
-- pip install anthropic
+- .env의 OPENAI_API_KEY
+- pip install -r requirements.txt
 
 사용:
   python main.py commit
   python main.py pr
   python main.py commit --safe-mode
+  python main.py  # 프롬프트에서 "코드변동사항" 입력
 """
 import argparse
+import importlib.util
 import os
 import re
 import subprocess
 import sys
 import textwrap
+from datetime import datetime
+from pathlib import Path
 
-DEFAULT_MODEL = "claude-haiku-4-5-20251001"
-DEFAULT_TEMPERATURE = 0.3
+DEFAULT_MODEL = "gpt-5-mini"
+DEFAULT_TEMPERATURE = None
 DEFAULT_MAX_TOKENS = 1024
 MAX_FILES = 10
 MAX_LINES = 200
@@ -36,6 +40,10 @@ def git_status() -> str:
     return run(["git", "status", "--short"])
 
 
+def git_status_full() -> str:
+    return run(["git", "status"])
+
+
 def git_diff() -> str:
     # staged + unstaged 모두 포함. HEAD 없는 신규 저장소는 staged만.
     try:
@@ -47,6 +55,15 @@ def git_diff() -> str:
 
 def git_branch() -> str:
     return run(["git", "branch", "--show-current"]).strip() or "(no branch)"
+
+
+def run_visible(cmd: list[str]) -> str:
+    """GitHub 반영 명령을 실행하고 실패 내용을 사용자에게 전달."""#ㅂㅂ
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    if res.returncode != 0:
+        detail = (res.stderr or res.stdout).strip()
+        raise RuntimeError(f"명령 실패: {' '.join(cmd)}\n{detail}")
+    return res.stdout.strip()
 
 
 # ========== 안전 모드 ==========
@@ -121,40 +138,69 @@ PR_PROMPT = """당신은 시니어 소프트웨어 엔지니어입니다. 아래
 """
 
 
-def call_anthropic(prompt: str, model: str, temperature: float, max_tokens: int) -> tuple[str, int]:
+def load_openai_environment() -> Path | None:
+    """프로젝트 .env를 우선하고, 사용자의 공용 Desktop .env를 대체 경로로 사용."""
     try:
-        import anthropic
+        from dotenv import load_dotenv
     except ImportError:
-        print("[ERROR] anthropic 패키지가 설치되지 않았습니다. pip install anthropic")
+        print("[ERROR] python-dotenv 패키지가 설치되지 않았습니다.")
+        print("# 설치: python3 -m pip install -r requirements.txt")
         sys.exit(2)
 
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        print("[ERROR] ANTHROPIC_API_KEY 환경변수가 설정되지 않았습니다.")
-        print("# 예) export ANTHROPIC_API_KEY=\"sk-ant-...\"")
+    candidates = [
+        Path(__file__).resolve().parent / ".env",
+        Path.cwd() / ".env",
+        Path.home() / "Desktop" / ".env",
+    ]
+    for env_path in dict.fromkeys(candidates):
+        if env_path.is_file():
+            load_dotenv(env_path, override=False)
+            if os.environ.get("OPENAI_API_KEY"):
+                return env_path
+    return None
+
+
+def call_openai(prompt: str, model: str, temperature: float | None, max_tokens: int) -> tuple[str, int]:
+    env_path = load_openai_environment()
+    if not os.environ.get("OPENAI_API_KEY"):
+        print("[ERROR] .env에서 OPENAI_API_KEY를 찾지 못했습니다.")
+        print('# 예) OPENAI_API_KEY="sk-..."')
         sys.exit(2)
 
-    client = anthropic.Anthropic()
     try:
-        resp = client.messages.create(
-            model=model, max_tokens=max_tokens, temperature=temperature,
-            messages=[{"role": "user", "content": prompt}],
+        import openai
+        from openai import OpenAI
+    except ImportError:
+        print("[ERROR] openai 패키지가 설치되지 않았습니다.")
+        print("# 설치: python3 -m pip install -r requirements.txt")
+        sys.exit(2)
+
+    print(f"[INFO] 환경 설정 로드: {env_path}")
+    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    try:
+        request = dict(
+            model=model,
+            input=prompt,
+            max_output_tokens=max_tokens,
         )
-    except anthropic.APIConnectionError as e:
+        if temperature is not None:
+            request["temperature"] = temperature
+        resp = client.responses.create(**request)
+    except openai.APIConnectionError as e:
         print(f"[ERROR] 네트워크 연결 실패: {e}")
         sys.exit(2)
-    except anthropic.AuthenticationError:
-        print("[ERROR] API Key 인증 실패. ANTHROPIC_API_KEY 값을 확인하세요.")
+    except openai.AuthenticationError:
+        print("[ERROR] API Key 인증 실패. OPENAI_API_KEY 값을 확인하세요.")
         sys.exit(2)
-    except anthropic.RateLimitError:
+    except openai.RateLimitError:
         print("[ERROR] Rate limit 도달. 잠시 후 재시도하세요.")
         sys.exit(2)
-    except anthropic.APIStatusError as e:
+    except openai.APIStatusError as e:
         print(f"[ERROR] API 오류 (status={e.status_code}): {e.message}")
         sys.exit(2)
 
-    text = "".join(b.text for b in resp.content if hasattr(b, "text"))
-    # 호출 횟수: 이 함수 1회 호출당 1회. 토큰 사용량도 함께 노출.
-    if hasattr(resp, "usage"):
+    text = resp.output_text
+    if resp.usage:
         print(f"[INFO] Tokens — input: {resp.usage.input_tokens}, output: {resp.usage.output_tokens}")
     return text.strip(), 1
 
@@ -205,7 +251,7 @@ def cmd_commit(args):
         print(f"[INFO] safe-mode: diff {n}줄로 잘라 보냅니다 (마스킹 적용).")
 
     print("[INFO] AI API 요청 중...")
-    text, calls = call_anthropic(
+    text, calls = call_openai(
         COMMIT_PROMPT.format(status=status, diff=diff),
         args.model, args.temperature, args.max_tokens,
     )
@@ -228,27 +274,114 @@ def cmd_pr(args):
         print(f"[INFO] safe-mode: diff {n}줄로 잘라 보냅니다 (마스킹 적용).")
 
     print("[INFO] AI API 요청 중...")
-    text, calls = call_anthropic(
+    text, calls = call_openai(
         PR_PROMPT.format(branch=branch, status=status, diff=diff),
         args.model, args.temperature, args.max_tokens,
     )
     print(f"[DONE] PR 초안 생성 완료 (API calls: {calls})\n")
     print(format_pr_block(text))
+    if not args.draft_only:
+        apply_pr_to_github(text)
+
+
+def split_pr_text(text: str) -> tuple[str, str]:
+    lines = text.strip().splitlines()
+    title = (lines[0] if lines else "AI generated update")[:80]
+    body = "\n".join(lines[1:]).strip()
+    return title, body
+
+
+def apply_pr_to_github(text: str):
+    """변경 사항을 커밋/push하고 GitHub PR을 실제 생성."""
+    if subprocess.run(["gh", "auth", "status"], capture_output=True).returncode != 0:
+        print("[ERROR] GitHub 로그인이 만료되어 PR을 반영하지 못했습니다.")
+        print("# 먼저 실행: gh auth login -h github.com -w")
+        return
+
+    title, body = split_pr_text(text)
+    branch = git_branch()
+    if branch in {"main", "master", "(no branch)"}:
+        branch = f"ai-gitgen/update-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        run_visible(["git", "switch", "-c", branch])
+        print(f"[INFO] PR 브랜치 생성: {branch}")
+
+    run_visible(["git", "add", "--all"])
+    staged = run_visible(["git", "diff", "--cached", "--name-only"])
+    if not staged:
+        print("[INFO] 커밋할 변경 사항이 없어 GitHub PR 생성을 건너뜁니다.")
+        return
+
+    run_visible(["git", "commit", "-m", title])
+    print(f"[DONE] Git 커밋 완료: {title}")
+    run_visible(["git", "push", "--set-upstream", "origin", branch])
+    print(f"[DONE] 원격 브랜치 반영 완료: origin/{branch}")
+    pr_url = run_visible(["gh", "pr", "create", "--title", title, "--body", body])
+    print(f"[DONE] GitHub PR 생성 완료: {pr_url}")
+
+
+def cmd_status(_args=None): #ㄴㄴ
+    print("[INFO] 현재 저장소의 코드 변동 사항입니다.\n")
+    print(git_status_full().rstrip())
+
+
+def run_interactive_prompt(parser):
+    try:
+        prompt = input('요청을 입력하세요 (예: 코드변동사항, PR 만들어줘): ').strip()
+    except EOFError:
+        parser.print_help()
+        return
+
+    normalized = re.sub(r"\s+", "", prompt).lower()
+
+    # 더 구체적인 생성 의도를 먼저 판별한다. 예: "코드 변경했으니 PR시켜"
+    if "pr" in normalized or "풀리퀘스트" in normalized or "pullrequest" in normalized:
+        cmd_pr(parser.parse_args(["pr"]))
+        return
+
+    if "커밋" in normalized or "commit" in normalized:
+        cmd_commit(parser.parse_args(["commit"]))
+        return
+
+    if "변동사항" in normalized or "변경사항" in normalized or "status" in normalized:
+        cmd_status()
+        return
+
+    print(f"[ERROR] 지원하지 않는 프롬프트입니다: {prompt}")
+    print('예시: "코드변동사항", "커밋 메시지 만들어줘", "PR 만들어줘"')
+
+
+def ensure_project_runtime():
+    """전역 의존성이 없으면 설치된 프로젝트 가상환경으로 자동 재실행."""
+    if importlib.util.find_spec("openai") and importlib.util.find_spec("dotenv"):
+        return
+
+    venv_dir = Path(__file__).resolve().parent / ".venv"
+    venv_python = venv_dir / "bin" / "python"
+    if venv_python.is_file() and Path(sys.prefix) != venv_dir:
+        os.execv(str(venv_python), [str(venv_python), str(Path(__file__).resolve()), *sys.argv[1:]])
 
 
 def main():
+    ensure_project_runtime()
     p = argparse.ArgumentParser(prog="ai-gitgen")
     p.add_argument("-model", dest="model", default=DEFAULT_MODEL)
     p.add_argument("-temperature", dest="temperature", type=float, default=DEFAULT_TEMPERATURE)
     p.add_argument("-max-tokens", dest="max_tokens", type=int, default=DEFAULT_MAX_TOKENS)
     p.add_argument("-safe-mode", dest="safe_mode", action="store_true",
                    help="diff에서 민감정보 마스킹 + 파일/줄 제한")
-    sub = p.add_subparsers(dest="cmd", required=True)
+    sub = p.add_subparsers(dest="cmd")
     sub.add_parser("commit").set_defaults(func=cmd_commit)
-    sub.add_parser("pr").set_defaults(func=cmd_pr)
+    pr_parser = sub.add_parser("pr")
+    pr_parser.add_argument("--draft-only", action="store_true",
+                           help="GitHub에 반영하지 않고 PR 초안만 출력")
+    pr_parser.set_defaults(func=cmd_pr)
+    sub.add_parser("status", help="현재 저장소의 git status 출력").set_defaults(func=cmd_status)
 
     args = p.parse_args()
     try:
+        if not args.cmd:
+            run_interactive_prompt(p)
+            return
         args.func(args)
     except RuntimeError as e:
         print(f"[ERROR] {e}")
