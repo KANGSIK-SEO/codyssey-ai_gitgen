@@ -47,7 +47,7 @@ def git_status_full() -> str:
 def git_diff() -> str:
     # staged + unstaged 모두 포함. HEAD 없는 신규 저장소는 staged만.
     try:
-        return run(["git", "diff", "HEAD"])
+        return run(["git", "diff", "HEAD"])#ㄹㄹ
     except RuntimeError:
         # 첫 커밋 전: HEAD 부재. staged 변경만 반환.
         return run(["git", "diff", "--cached"])
