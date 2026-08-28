@@ -43,7 +43,7 @@ def git_status() -> str:
 def git_status_full() -> str:
     return run(["git", "status"])
 
-
+# 코드를 짧게 해주세요
 def git_diff() -> str:
     # staged + unstaged 모두 포함. HEAD 없는 신규 저장소는 staged만.
     try:
